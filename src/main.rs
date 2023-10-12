@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use crossbeam::queue::ArrayQueue;
 use device_query::mouse_state::MousePosition;
-use device_query::DeviceEvents;
 use device_query::{DeviceQuery, DeviceState, Keycode, MouseState};
 use egui::{self, ImageSource, Pos2, Rect, Vec2};
 use egui_wgpu::renderer::ScreenDescriptor;
@@ -9,6 +9,11 @@ use egui_wgpu::{wgpu::Dx12Compiler, Renderer};
 use include_dir::include_dir;
 use include_dir::Dir;
 use raw_window_handle::HasRawWindowHandle;
+use rodio::{source::Source, Decoder, OutputStream};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
 use tray_icon::{menu, menu::Menu, TrayIconBuilder};
 use winit::event_loop::EventLoopBuilder;
 use winit::{event::*, event_loop::ControlFlow, window::WindowLevel};
@@ -21,9 +26,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Animation {
+    id: usize,
+    frame: u8,
+    position: MousePosition,
+    last_update: std::time::Instant,
+}
+
 enum CustomEvent {
-    Animate(u8, MousePosition),
-    Clear,
+    Animate(Animation),
+    Clear(usize),
 }
 
 async fn run() {
@@ -42,10 +55,48 @@ async fn run() {
     let event_loop = EventLoopBuilder::<CustomEvent>::with_user_event().build();
     let event_loop_proxy = event_loop.create_proxy();
 
-    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    let animations: Arc<ArrayQueue<Animation>> = Arc::new(ArrayQueue::new(10));
+    let animations_clone = animations.clone();
+
+    let frame_time = (1.0 / 60.0);
+    let animation_driver_handle = std::thread::spawn(move || {
+        let mut local_animation_queue = Vec::new();
+        let animations = animations_clone;
+
+        loop {
+            while animations.is_empty() && local_animation_queue.is_empty() {
+                std::thread::park();
+            }
+
+            while let Some(animation) = animations.pop() {
+                local_animation_queue.push(animation);
+            }
+
+            for animation in local_animation_queue.iter_mut() {
+                let elapsed = animation.last_update.elapsed();
+                if elapsed.as_secs_f64() > frame_time {
+                    animation.frame += 1;
+                    animation.last_update = std::time::Instant::now();
+                    if animation.frame < 60 {
+                        event_loop_proxy
+                            .send_event(CustomEvent::Animate(animation.clone()))
+                            .ok();
+                    } else {
+                        event_loop_proxy
+                            .send_event(CustomEvent::Clear(animation.id))
+                            .ok();
+                    }
+                }
+            }
+
+            local_animation_queue.retain(|animation| animation.frame < 60);
+        }
+    });
+
     std::thread::spawn(move || {
         let mut primed = false;
         let device_state = DeviceState::new();
+        let mut animation_id = 0;
 
         rdev::listen(move |e: rdev::Event| match e.event_type {
             rdev::EventType::KeyPress(key) => {
@@ -62,28 +113,23 @@ async fn run() {
                 if primed && button == rdev::Button::Left {
                     let mouse: MouseState = device_state.get_mouse();
                     let pos = mouse.coords;
-                    dbg!(pos);
-
+                    animation_id += 1;
                     // NOTE: Blocking here causes mouse to freeze so we send and bail
-                    let _ = tx.try_send(pos);
+                    animations
+                        .push(Animation {
+                            id: animation_id,
+                            frame: 0,
+                            position: pos,
+                            last_update: std::time::Instant::now(),
+                        })
+                        .ok();
+                    animation_driver_handle.thread().unpark();
                 }
             }
 
             _ => {}
         })
         .unwrap();
-    });
-
-    let frame_time = 1.0 / 60.0;
-    std::thread::spawn(move || loop {
-        let pos = rx.recv().unwrap();
-        for frame in 0..=60 {
-            std::thread::sleep(std::time::Duration::from_secs_f64(frame_time));
-            event_loop_proxy
-                .send_event(CustomEvent::Animate(frame, pos))
-                .ok();
-        }
-        event_loop_proxy.send_event(CustomEvent::Clear).ok();
     });
 
     let available_monitors = event_loop.available_monitors();
@@ -169,13 +215,12 @@ async fn run() {
 
         *control_flow = ControlFlow::Wait;
         match event {
-            Event::UserEvent(CustomEvent::Animate(frame, pos)) => {
-                my_app.current_frame = Some(frame);
-                my_app.mouse_position = pos;
+            Event::UserEvent(CustomEvent::Animate(animation)) => {
+                my_app.add_animation(animation);
                 egui_context.request_repaint();
             }
-            Event::UserEvent(CustomEvent::Clear) => {
-                my_app.current_frame = None;
+            Event::UserEvent(CustomEvent::Clear(animation_id)) => {
+                my_app.remove_animation(animation_id);
                 egui_context.request_repaint();
             }
             Event::WindowEvent {
@@ -263,8 +308,7 @@ async fn run() {
 struct MyApp {
     offset: f32,
     frames: Vec<egui::ImageSource<'static>>,
-    current_frame: Option<u8>,
-    mouse_position: MousePosition,
+    animations: HashMap<usize, Animation>,
 }
 
 impl MyApp {
@@ -284,20 +328,19 @@ impl MyApp {
         Self {
             offset,
             frames,
-            current_frame: None,
-            mouse_position: (0, 0),
+            animations: HashMap::new(),
         }
     }
 }
 
 impl MyApp {
     fn ui(&mut self, ctx: &egui::Context) {
-        if let Some(frame) = self.current_frame {
-            let current_frame = self.frames[frame as usize].clone();
+        for animation in self.animations.values() {
+            let current_frame = self.frames[animation.frame as usize].clone();
             let position = Rect::from_center_size(
                 Pos2::new(
-                    self.mouse_position.0 as f32 + self.offset,
-                    self.mouse_position.1 as _,
+                    animation.position.0 as f32 + self.offset,
+                    animation.position.1 as _,
                 ),
                 Vec2::new(500.0, 500.0),
             );
@@ -311,6 +354,14 @@ impl MyApp {
 
             ctx.request_repaint();
         }
+    }
+
+    fn add_animation(&mut self, animation: Animation) {
+        self.animations.insert(animation.id, animation);
+    }
+
+    fn remove_animation(&mut self, animation_id: usize) {
+        self.animations.remove(&animation_id);
     }
 }
 

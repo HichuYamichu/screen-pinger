@@ -23,3 +23,5 @@ windows = { version = "0.51.1", features = [
 ] }
 raw-window-handle = "0.5.2"
 tray-icon = "0.9.0"
+rodio = "0.17.1"
+crossbeam = { version = "0.8.2", features = ["crossbeam-queue"] }
