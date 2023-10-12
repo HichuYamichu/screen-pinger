@@ -64,6 +64,7 @@ async fn run() {
         let animations = animations_clone;
 
         loop {
+            // NOTE: avoid spinning with `park`
             while animations.is_empty() && local_animation_queue.is_empty() {
                 std::thread::park();
             }
