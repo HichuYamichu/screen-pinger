@@ -2,14 +2,14 @@
 
 use crossbeam::queue::ArrayQueue;
 use device_query::mouse_state::MousePosition;
-use device_query::{DeviceQuery, DeviceState, Keycode, MouseState};
+use device_query::{DeviceQuery, DeviceState, MouseState};
 use egui::{self, ImageSource, Pos2, Rect, Vec2};
 use egui_wgpu::renderer::ScreenDescriptor;
 use egui_wgpu::{wgpu::Dx12Compiler, Renderer};
 use include_dir::include_dir;
 use include_dir::Dir;
 use raw_window_handle::HasRawWindowHandle;
-use rodio::{source::Source, Decoder, OutputStream};
+use rodio::{source::Source, Decoder};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -58,7 +58,7 @@ async fn run() {
     let animations: Arc<ArrayQueue<Animation>> = Arc::new(ArrayQueue::new(10));
     let animations_clone = animations.clone();
 
-    let frame_time = (1.0 / 60.0);
+    let frame_time = 1.0 / 60.0;
     let animation_driver_handle = std::thread::spawn(move || {
         let mut local_animation_queue = Vec::new();
         let animations = animations_clone;
@@ -97,6 +97,9 @@ async fn run() {
         let mut primed = false;
         let device_state = DeviceState::new();
         let mut animation_id = 0;
+        let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
+        let file = BufReader::new(File::open("assets/ping_missing.ogg").unwrap());
+        let source = Decoder::new(file).unwrap().buffered();
 
         rdev::listen(move |e: rdev::Event| match e.event_type {
             rdev::EventType::KeyPress(key) => {
@@ -114,19 +117,20 @@ async fn run() {
                     let mouse: MouseState = device_state.get_mouse();
                     let pos = mouse.coords;
                     animation_id += 1;
-                    // NOTE: Blocking here causes mouse to freeze so we send and bail
-                    animations
-                        .push(Animation {
-                            id: animation_id,
-                            frame: 0,
-                            position: pos,
-                            last_update: std::time::Instant::now(),
-                        })
-                        .ok();
-                    animation_driver_handle.thread().unpark();
+                    // NOTE: Blocking here causes mouse to freeze so we do this the quick way
+                    if let Ok(_) = animations.push(Animation {
+                        id: animation_id,
+                        frame: 0,
+                        position: pos,
+                        last_update: std::time::Instant::now(),
+                    }) {
+                        stream_handle
+                            .play_raw(source.clone().convert_samples())
+                            .ok();
+                        animation_driver_handle.thread().unpark();
+                    }
                 }
             }
-
             _ => {}
         })
         .unwrap();
