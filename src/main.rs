@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use device_query::mouse_state::MousePosition;
+use device_query::DeviceEvents;
 use device_query::{DeviceQuery, DeviceState, Keycode, MouseState};
 use egui::{self, ImageSource, Pos2, Rect, Vec2};
 use egui_wgpu::renderer::ScreenDescriptor;
@@ -43,17 +44,31 @@ async fn run() {
 
     let (tx, rx) = std::sync::mpsc::sync_channel(0);
     std::thread::spawn(move || {
+        let mut primed = false;
         let device_state = DeviceState::new();
 
         rdev::listen(move |e: rdev::Event| match e.event_type {
             rdev::EventType::KeyPress(key) => {
-                if key == rdev::Key::KeyA {
+                if key == rdev::Key::Alt {
+                    primed = true;
+                }
+            }
+            rdev::EventType::KeyRelease(key) => {
+                if key == rdev::Key::Alt {
+                    primed = false;
+                }
+            }
+            rdev::EventType::ButtonPress(button) => {
+                if primed && button == rdev::Button::Left {
                     let mouse: MouseState = device_state.get_mouse();
                     let pos = mouse.coords;
-                    // NOTE: Blocking here causes mouse to freeze
+                    dbg!(pos);
+
+                    // NOTE: Blocking here causes mouse to freeze so we send and bail
                     let _ = tx.try_send(pos);
                 }
             }
+
             _ => {}
         })
         .unwrap();
@@ -72,6 +87,7 @@ async fn run() {
     });
 
     let available_monitors = event_loop.available_monitors();
+    let mut offset = f32::MAX;
     let mut total_width = 0;
     let mut total_height = 0;
 
@@ -79,11 +95,15 @@ async fn run() {
         let monitor_size = monitor.size();
         total_width += monitor_size.width;
         total_height += monitor_size.height;
+        let monitor_position = monitor.position();
+        if (monitor_position.x as f32) < offset {
+            offset = monitor_position.x as f32;
+        }
     }
 
     let window = winit::window::WindowBuilder::new()
         .with_inner_size(winit::dpi::PhysicalSize::new(total_width, total_height))
-        .with_position(winit::dpi::PhysicalPosition::new(0.0, 0.0))
+        .with_position(winit::dpi::PhysicalPosition::new(offset, 0.0))
         .with_transparent(true)
         .with_decorations(false)
         .build(&event_loop)
@@ -136,7 +156,7 @@ async fn run() {
     let egui_context = egui::Context::default();
     egui_extras::install_image_loaders(&egui_context);
     let mut egui_renderer = Renderer::new(&device, config.format, None, 1);
-    let mut my_app = MyApp::default();
+    let mut my_app = MyApp::new(offset.abs());
 
     event_loop.run(move |event, _, control_flow| {
         let _ = (
@@ -161,22 +181,10 @@ async fn run() {
             Event::WindowEvent {
                 event: window_event,
                 ..
-            } => {
-                match window_event {
-                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                    WindowEvent::Resized(new_size) => {
-                        // Resize with 0 width and height is used by winit to signal a minimize event on Windows.
-                        // See: https://github.com/rust-windowing/winit/issues/208
-                        // This solves an issue where the app would panic when minimizing on Windows.
-                        if new_size.width > 0 && new_size.height > 0 {
-                            config.width = new_size.width;
-                            config.height = new_size.height;
-                            surface.configure(&device, &config);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            } => match window_event {
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                _ => {}
+            },
             Event::RedrawEventsCleared => {
                 window.request_redraw();
             }
@@ -253,13 +261,14 @@ async fn run() {
 }
 
 struct MyApp {
+    offset: f32,
     frames: Vec<egui::ImageSource<'static>>,
     current_frame: Option<u8>,
     mouse_position: MousePosition,
 }
 
-impl Default for MyApp {
-    fn default() -> Self {
+impl MyApp {
+    fn new(offset: f32) -> Self {
         let frames = ASSET_DIR
             .files()
             .map(|f| {
@@ -273,6 +282,7 @@ impl Default for MyApp {
             .collect::<Vec<_>>();
 
         Self {
+            offset,
             frames,
             current_frame: None,
             mouse_position: (0, 0),
@@ -285,7 +295,10 @@ impl MyApp {
         if let Some(frame) = self.current_frame {
             let current_frame = self.frames[frame as usize].clone();
             let position = Rect::from_center_size(
-                Pos2::new(self.mouse_position.0 as _, self.mouse_position.1 as _),
+                Pos2::new(
+                    self.mouse_position.0 as f32 + self.offset,
+                    self.mouse_position.1 as _,
+                ),
                 Vec2::new(500.0, 500.0),
             );
 
