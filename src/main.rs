@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use tray_icon::{menu, menu::Menu, TrayIconBuilder};
 use winit::event_loop::EventLoopBuilder;
 use winit::{event::*, event_loop::ControlFlow, window::WindowLevel};
@@ -24,6 +25,10 @@ static ICON: &[u8] = include_bytes!("../assets/question.png");
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     pollster::block_on(run());
     Ok(())
+}
+
+struct AnimationDesc {
+    frames: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,44 +100,116 @@ async fn run() {
     });
 
     std::thread::spawn(move || {
+        struct AnimationQueue {
+            id: usize,
+            queue: Arc<ArrayQueue<Animation>>,
+            animation_driver_handle: JoinHandle<()>,
+        }
+
+        impl AnimationQueue {
+            fn new(
+                queue: Arc<ArrayQueue<Animation>>,
+                animation_driver_handle: JoinHandle<()>,
+            ) -> Self {
+                Self {
+                    id: 0,
+                    queue,
+                    animation_driver_handle,
+                }
+            }
+
+            fn run_animation(&mut self, pos: (i32, i32)) -> bool {
+                self.id += 1;
+                let animation = Animation {
+                    id: self.id,
+                    frame: 0,
+                    position: pos,
+                    last_update: std::time::Instant::now(),
+                };
+                // NOTE: Blocking here causes mouse to freeze so we do this the quick way
+                if let Ok(_) = self.queue.push(animation) {
+                    self.animation_driver_handle.thread().unpark();
+                    return true;
+                }
+                false
+            }
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum Direction {
+            Up,
+            Down,
+            Left,
+            Right,
+        }
+
+        fn calc_movement(prev: (i32, i32), curr: (i32, i32)) -> (Direction, f64) {
+            let dx = curr.0 - prev.0;
+            let dy = curr.1 - prev.1;
+
+            let direction = if dx.abs() > dy.abs() {
+                if dx > 0 {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                }
+            } else {
+                if dy > 0 {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                }
+            };
+            let distance = ((dx * dx + dy * dy) as f64).sqrt();
+            (direction, distance)
+        }
+
+        let mut animation_queue = AnimationQueue::new(animations, animation_driver_handle);
         let mut primed = false;
+        let mut start_position = None;
         let device_state = DeviceState::new();
-        let mut animation_id = 0;
         let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
         let file = BufReader::new(File::open("assets/ping_missing.ogg").unwrap());
         let source = Decoder::new(file).unwrap().buffered();
 
-        rdev::listen(move |e: rdev::Event| match e.event_type {
-            rdev::EventType::KeyPress(key) => {
-                if key == rdev::Key::Alt {
+        rdev::listen(move |e: rdev::Event| {
+            match e.event_type {
+                rdev::EventType::KeyPress(rdev::Key::Alt) => {
                     primed = true;
                 }
-            }
-            rdev::EventType::KeyRelease(key) => {
-                if key == rdev::Key::Alt {
+                rdev::EventType::KeyRelease(rdev::Key::Alt) => {
                     primed = false;
                 }
-            }
-            rdev::EventType::ButtonPress(button) => {
-                if primed && button == rdev::Button::Left {
+                rdev::EventType::ButtonPress(rdev::Button::Left) if primed => {
                     let mouse: MouseState = device_state.get_mouse();
-                    let pos = mouse.coords;
-                    animation_id += 1;
-                    // NOTE: Blocking here causes mouse to freeze so we do this the quick way
-                    if let Ok(_) = animations.push(Animation {
-                        id: animation_id,
-                        frame: 0,
-                        position: pos,
-                        last_update: std::time::Instant::now(),
-                    }) {
-                        stream_handle
-                            .play_raw(source.clone().convert_samples())
-                            .ok();
-                        animation_driver_handle.thread().unpark();
-                    }
+                    start_position = Some(mouse.coords);
                 }
+                rdev::EventType::ButtonRelease(rdev::Button::Left) => match start_position {
+                    Some(pos) if primed => {
+                        const BREAKEPOINT: f64 = 100.0;
+
+                        let mouse: MouseState = device_state.get_mouse();
+                        let current_pos = mouse.coords;
+                        let (direction, distance) = calc_movement(pos, current_pos);
+
+                        let success = match direction {
+                            Direction::Left if distance >= BREAKEPOINT => {
+                                Some(animation_queue.run_animation(pos))
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(true) = success {
+                            stream_handle
+                                .play_raw(source.clone().convert_samples())
+                                .ok();
+                        }
+                    }
+                    _ => start_position = None,
+                },
+                _ => {}
             }
-            _ => {}
+            // return Some(e);
         })
         .unwrap();
     });
